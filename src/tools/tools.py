@@ -1,120 +1,142 @@
-from langchain.tools import tool
-import requests
-from dotenv import load_dotenv
-import os
-from tavily import TavilyClient
-from rich import print
-from bs4 import BeautifulSoup
-from readability import Document
-import trafilatura
+"""Web search and page-scraping tools used by the research agents."""
+
+from __future__ import annotations
+
 import re
+from functools import lru_cache
+from typing import Any
 
-load_dotenv()
+import requests
+import trafilatura
+from bs4 import BeautifulSoup
+from langchain_core.tools import tool
+from readability import Document
 
-tavily = TavilyClient(api_key = os.getenv("TAVILY_API_KEY"))
+from src.config import get_tavily_api_key
+
+REQUEST_TIMEOUT_SECONDS = 20
+MAX_PAGE_CHARS = 5_000
+_USER_AGENT = (
+    "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
+    "AppleWebKit/537.36 (KHTML, like Gecko) "
+    "Chrome/124.0 Safari/537.36"
+)
+_REMOVABLE_TAGS = ("script", "style", "nav", "footer", "header", "aside", "form")
+
+
+@lru_cache(maxsize=1)
+def _tavily_client() -> Any:
+    """Create the Tavily client lazily so importing this module never fails."""
+    from tavily import TavilyClient
+
+    return TavilyClient(api_key=get_tavily_api_key())
+
 
 @tool
-def web_search(query : str) -> str:
-    """Search the web for recent and reliable information on a topic.
-    Returns Titles, URL"""
-    results = tavily.search(query = query, max_results=3)
+def web_search(query: str, max_results: int = 4) -> str:
+    """Search the web for recent, reliable information about a topic.
 
-    out = []
+    Returns each result as a title, URL, and short snippet. Call this before
+    scraping a page so you can choose useful sources.
+    """
+    query = (query or "").strip()
+    if not query:
+        return "Search error: the query is empty."
 
-    for r in results.get('results', []):
-        out.append(
-            f"Title: {r.get('title', '')}\n"
-            f"URL: {r.get('url', '')}\n"
-            f"Snippet: {r.get('content', '')[:300]}\n"
-
+    try:
+        limit = max(1, min(int(max_results), 8))
+        results = _tavily_client().search(
+            query=query,
+            max_results=limit,
+            search_depth="advanced",
         )
-    return "\n----\n".join(out)
+    except Exception as exc:  # Network and API errors are reported to the agent.
+        return f"Search error for '{query}': {exc}"
+
+    rows: list[str] = []
+    for item in results.get("results", []):
+        title = (item.get("title") or "(untitled)").strip()
+        url = (item.get("url") or "").strip()
+        snippet = re.sub(r"\s+", " ", item.get("content") or "").strip()
+        rows.append(f"Title: {title}\nURL: {url}\nSnippet: {snippet[:400]}")
+
+    return "\n---\n".join(rows) if rows else f"No search results found for '{query}'."
+
+
+def _clean_text(text: str) -> str:
+    return re.sub(r"\s+", " ", text).strip()
+
+
+def _soup_text(html: str) -> str:
+    soup = BeautifulSoup(html, "html.parser")
+    for tag in soup(_REMOVABLE_TAGS):
+        tag.decompose()
+    return _clean_text(soup.get_text(separator=" "))
+
 
 @tool
 def scrape_url(url: str) -> str:
+    """Download a web page and return its clean, readable text.
+
+    The result is capped at 5,000 characters and falls back through several
+    extraction strategies so news articles, blogs, and documentation pages
+    all work reasonably well.
     """
-    Scrape and extract clean readable content from a URL.
-    Uses multiple extraction strategies for better reliability.
-    """
+    url = (url or "").strip()
+    if not url.startswith(("http://", "https://")):
+        return "Scrape error: the URL must start with http:// or https://."
+
     headers = {
-        "User-Agent": (
-            "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
-            "AppleWebKit/537.36 (KHTML, like Gecko) "
-            "Chrome/124.0 Safari/537.36"
-        ),
+        "User-Agent": _USER_AGENT,
         "Accept-Language": "en-US,en;q=0.9",
         "Referer": "https://www.google.com/",
     }
 
     try:
-        # Fetch page
         response = requests.get(
             url,
             headers=headers,
-            timeout=15,
+            timeout=REQUEST_TIMEOUT_SECONDS,
             allow_redirects=True,
         )
-        response.raise_for_status()
+    except requests.RequestException as exc:
+        return f"Scrape error for {url}: {exc}"
 
-        html = response.text
+    if response.status_code >= 400:
+        return f"Scrape error for {url}: HTTP {response.status_code}."
 
-        # ———————————————
-        # Strategy 1 → trafilatura (BEST for articles/blogs)
-        # ———————————————
+    html = response.text
+    if not html.strip():
+        return f"Scrape error for {url}: the server returned an empty page."
+
+    # Strategy 1: trafilatura (best for articles and blogs).
+    try:
         extracted = trafilatura.extract(
             html,
             include_comments=False,
-            include_tables=False,
+            include_tables=True,
+            include_links=False,
         )
+    except Exception:
+        extracted = None
+    if extracted and len(extracted.strip()) > 200:
+        return _clean_text(extracted)[:MAX_PAGE_CHARS]
 
-        if extracted and len(extracted.strip()) > 200:
-            cleaned = re.sub(r"\s+", " ", extracted)
-            return cleaned[:5000]
+    # Strategy 2: readability-lxml.
+    try:
+        summary_html = Document(html).summary()
+        readable = _soup_text(summary_html)
+    except Exception:
+        readable = ""
+    if len(readable) > 200:
+        return readable[:MAX_PAGE_CHARS]
 
-        # ———————————————
-        # Strategy 2 → readability
-        # ———————————————
-        doc = Document(html)
-        clean_html = doc.summary()
+    # Strategy 3: raw BeautifulSoup text.
+    raw_text = _soup_text(html)
+    if raw_text:
+        return raw_text[:MAX_PAGE_CHARS]
 
-        soup = BeautifulSoup(clean_html, "html.parser")
+    return f"Scrape error for {url}: could not extract meaningful content."
 
-        for tag in soup([
-            "script",
-            "style",
-            "nav",
-            "footer",
-            "header",
-            "aside",
-            "form",
-        ]):
-            tag.decompose()
 
-        text = soup.get_text(separator=" ")
-        cleaned = re.sub(r"\s+", " ", text).strip()
-
-        if len(cleaned) > 200:
-            return cleaned[:5000]
-
-        # ———————————————
-        # Strategy 3 → raw soup fallback
-        # ———————————————
-        soup_raw = BeautifulSoup(html, "html.parser")
-        for tag in soup_raw([
-            "script",
-            "style",
-            "nav",
-            "footer",
-            "header",
-            "aside",
-            "form",
-        ]):
-            tag.decompose()
-
-        raw_text = soup_raw.get_text(separator=" ")
-        cleaned_raw = re.sub(r"\s+", " ", raw_text).strip()
-
-        return cleaned_raw[:5000] if cleaned_raw else "Error: Could not extract meaningful content from the page."
-
-    except Exception as e:
-        return f"Error scraping URL: {str(e)}"
+__all__ = ["scrape_url", "web_search"]
